@@ -182,12 +182,21 @@ impl GC {
                 break;
             }
 
-            // If the task has no content length, skip it.
+            // If the task has downloaded finished, task has the content length, evicted space is the
+            // content length. If the task has started and did not download the data, and content
+            // length is 0, evicted space is 0.
             let task_space = match task.content_length() {
                 Some(content_length) => content_length,
                 None => {
-                    error!("task {} has no content length", task.id);
-                    continue;
+                    // If the task has no content length, skip it.
+                    if !task.is_failed() {
+                        error!("task {} has no content length", task.id);
+                        continue;
+                    }
+
+                    // If the task has started and did not download the data, and content length is 0.
+                    info!("task {} is failed, has no content length", task.id);
+                    0
                 }
             };
 
