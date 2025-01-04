@@ -1,5 +1,5 @@
 /*
- *     Copyright 2023 The Dragonfly Authors
+ *     Copyright 2025 The Dragonfly Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,15 +14,4 @@
  * limitations under the License.
  */
 
-pub mod announcer;
-pub mod dynconfig;
-pub mod gc;
-pub mod grpc;
-pub mod health;
-pub mod metrics;
-pub mod proxy;
-pub mod resource;
-pub mod shutdown;
-pub mod stats;
-pub mod syncer;
-pub mod tracing;
+pub mod host_info;

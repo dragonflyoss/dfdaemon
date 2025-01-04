@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use super::interceptor::TracingInterceptor;
 use crate::metrics::{
     collect_delete_task_failure_metrics, collect_delete_task_started_metrics,
     collect_download_task_failure_metrics, collect_download_task_finished_metrics,
@@ -23,6 +24,7 @@ use crate::metrics::{
 };
 use crate::resource::{persistent_cache_task, task};
 use crate::shutdown;
+use crate::syncer::host_info::HostInfo;
 use dragonfly_api::common::v2::{Host, PersistentCacheTask, Piece, Priority, Task, TaskType};
 use dragonfly_api::dfdaemon::v2::{
     dfdaemon_upload_client::DfdaemonUploadClient as DfdaemonUploadGRPCClient,
@@ -55,8 +57,6 @@ use tonic::{
 use tracing::{debug, error, info, instrument, Instrument, Span};
 use url::Url;
 
-use super::interceptor::TracingInterceptor;
-
 /// DfdaemonUploadServer is the grpc server of the upload.
 pub struct DfdaemonUploadServer {
     /// config is the configuration of the dfdaemon.
@@ -84,6 +84,7 @@ impl DfdaemonUploadServer {
         addr: SocketAddr,
         task: Arc<task::Task>,
         persistent_cache_task: Arc<persistent_cache_task::PersistentCacheTask>,
+        host_info: Arc<HostInfo>,
         shutdown: shutdown::Shutdown,
         shutdown_complete_tx: mpsc::UnboundedSender<()>,
     ) -> Self {
@@ -92,6 +93,7 @@ impl DfdaemonUploadServer {
             socket_path: config.download.server.socket_path.clone(),
             task,
             persistent_cache_task,
+            host_info,
         })
         .max_decoding_message_size(usize::MAX)
         .max_encoding_message_size(usize::MAX);
@@ -176,6 +178,9 @@ pub struct DfdaemonUploadServerHandler {
 
     /// persistent_cache_task is the persistent cache task manager.
     persistent_cache_task: Arc<persistent_cache_task::PersistentCacheTask>,
+
+    /// host_info is the local host info manager.
+    host_info: Arc<HostInfo>,
 }
 
 /// DfdaemonUploadServerHandler implements the dfdaemon upload grpc service.
@@ -865,9 +870,65 @@ impl DfdaemonUpload for DfdaemonUploadServerHandler {
     #[instrument(skip_all)]
     async fn sync_host(
         &self,
-        _request: Request<SyncHostRequest>,
+        request: Request<SyncHostRequest>,
     ) -> Result<Response<Self::SyncHostStream>, Status> {
-        unimplemented!()
+        // Get request ip.
+        let request_ip = request.remote_addr();
+
+        // Clone the request.
+        let request = request.into_inner();
+
+        // Generate the host id.
+        let host_id = self.task.id_generator.host_id();
+
+        // Get the remote host id from the request.
+        let remote_host_id = request.host_id;
+
+        // Get the remote peer id from the request;
+        let remote_peer_id = request.peer_id;
+
+        // Span record the host id and task id.
+        Span::current().record("host_id", host_id.clone());
+        match request_ip {
+            None => Span::current().record("request_ip", "None"),
+            Some(ip) => Span::current().record("request_ip", ip.to_string().as_str()),
+        };
+
+        Span::current().record("remote_host_id", remote_host_id.as_str());
+        Span::current().record("remote_peer_id", remote_peer_id.as_str());
+
+        // Clone the host state.
+        let host_info = self.host_info.clone();
+
+        // Initialize stream channel.
+        let (out_stream_tx, out_stream_rx) = mpsc::channel(10 * 1024);
+        tokio::spawn(
+            async move {
+                info!("start send host info to host {}", host_id);
+                loop {
+                    // Get host info from local host info manager.
+                    let host = host_info.get_host_info(request_ip);
+
+                    if let Ok(host) = host {
+                        match out_stream_tx.send(Ok(host.clone())).await {
+                            Ok(_) => {
+                                debug!("sync host state to host {}", host_id.as_str());
+                            }
+                            Err(err) => {
+                                info!("connection broken from host {}, err: {}", host_id, err);
+                                drop(out_stream_tx);
+                                break;
+                            }
+                        }
+                    };
+
+                    // Wait for the piece to be finished.
+                    tokio::time::sleep(host_info.get_interval()).await;
+                }
+            }
+            .in_current_span(),
+        );
+        Ok(Response::new(ReceiverStream::new(out_stream_rx)))
     }
 
     /// DownloadPersistentCacheTaskStream is the stream of the download persistent cache task response.

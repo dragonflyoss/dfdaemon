@@ -28,6 +28,7 @@ use dragonfly_client::proxy::Proxy;
 use dragonfly_client::resource::{persistent_cache_task::PersistentCacheTask, task::Task};
 use dragonfly_client::shutdown;
 use dragonfly_client::stats::Stats;
+use dragonfly_client::syncer::host_info::HostInfo;
 use dragonfly_client::tracing::init_tracing;
 use dragonfly_client_backend::BackendFactory;
 use dragonfly_client_config::dfdaemon;
@@ -280,12 +281,17 @@ async fn main() -> Result<(), anyhow::Error> {
         error!("initialize scheduler announcer failed: {}", err);
     })?;
 
+    // Initialize host info manager.
+    let host_info = HostInfo::new(config.clone())?;
+    let host_info = Arc::new(host_info);
+
     // Initialize upload grpc server.
     let mut dfdaemon_upload_grpc = DfdaemonUploadServer::new(
         config.clone(),
         SocketAddr::new(config.upload.server.ip.unwrap(), config.upload.server.port),
         task.clone(),
         persistent_cache_task.clone(),
+        host_info.clone(),
         shutdown.clone(),
         shutdown_complete_tx.clone(),
     );
@@ -343,6 +349,10 @@ async fn main() -> Result<(), anyhow::Error> {
 
         _ = tokio::spawn(async move { gc.run().await }) => {
             info!("garbage collector exited");
+        },
+
+        _ = tokio::spawn(async move { host_info.run().await }) => {
+            info!("host info manager exited");
         },
 
         _ = {
