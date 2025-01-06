@@ -127,8 +127,7 @@ impl HostInfo {
                 if let Ok(name) = entry.file_name().into_string() {
                     // Read interface speed from `/sys/class/net/{interface}/speed`
                     let speed_path = format!("/sys/class/net/{}/speed", name);
-                    let content = fs::read_to_string(speed_path)
-                        .unwrap_or("10000".to_string());
+                    let content = fs::read_to_string(speed_path).unwrap_or("10000".to_string());
 
                     if let Ok(speed) = content.trim().parse::<u64>() {
                         // Convert Mib/Sec to bit/Sec & Insert into network info.
@@ -160,12 +159,9 @@ impl HostInfo {
         if let Some(ip) = ip {
             for interface in network_info.ip_segments.iter() {
                 // Check if segments contain this ip.
-                let segment = interface.iter()
-                    .find(|&&x| x.contains(ip.ip()));
+                let segment = interface.iter().find(|&&x| x.contains(ip.ip()));
                 if segment.is_some() {
-                    if let Some(ab) = network_info
-                        .available_bandwidth
-                        .get(interface.key()) {
+                    if let Some(ab) = network_info.available_bandwidth.get(interface.key()) {
                         network.upload_rate = ab.value().as_u64();
                     }
                     break;
