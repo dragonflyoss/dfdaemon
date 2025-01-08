@@ -24,8 +24,10 @@ use crate::metrics::{
 };
 use crate::resource::{persistent_cache_task, task};
 use crate::shutdown;
-use crate::syncer::host_info::HostInfo;
-use dragonfly_api::common::v2::{Host, PersistentCacheTask, Piece, Priority, Task, TaskType};
+use bytesize::ByteSize;
+use dragonfly_api::common::v2::{
+    Host, Network, PersistentCacheTask, Piece, Priority, Task, TaskType,
+};
 use dragonfly_api::dfdaemon::v2::{
     dfdaemon_upload_client::DfdaemonUploadClient as DfdaemonUploadGRPCClient,
     dfdaemon_upload_server::{DfdaemonUpload, DfdaemonUploadServer as DfdaemonUploadGRPCServer},
@@ -41,13 +43,17 @@ use dragonfly_client_core::{
     Error as ClientError, Result as ClientResult,
 };
 use dragonfly_client_util::http::{get_range, hashmap_to_headermap, headermap_to_hashmap};
+use pnet::datalink;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+use sysinfo::Networks;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::sync::Barrier;
+use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
 use tonic::{
@@ -84,7 +90,6 @@ impl DfdaemonUploadServer {
         addr: SocketAddr,
         task: Arc<task::Task>,
         persistent_cache_task: Arc<persistent_cache_task::PersistentCacheTask>,
-        host_info: Arc<HostInfo>,
         shutdown: shutdown::Shutdown,
         shutdown_complete_tx: mpsc::UnboundedSender<()>,
     ) -> Self {
@@ -93,7 +98,7 @@ impl DfdaemonUploadServer {
             socket_path: config.download.server.socket_path.clone(),
             task,
             persistent_cache_task,
-            host_info,
+            sync_interval: config.download.parent_selector.sync_interval,
         })
         .max_decoding_message_size(usize::MAX)
         .max_encoding_message_size(usize::MAX);
@@ -179,8 +184,8 @@ pub struct DfdaemonUploadServerHandler {
     /// persistent_cache_task is the persistent cache task manager.
     persistent_cache_task: Arc<persistent_cache_task::PersistentCacheTask>,
 
-    /// host_info is the local host info manager.
-    host_info: Arc<HostInfo>,
+    /// sync_interval is the interval to send host info by sync_host.
+    sync_interval: Duration,
 }
 
 /// DfdaemonUploadServerHandler implements the dfdaemon upload grpc service.
@@ -897,33 +902,90 @@ impl DfdaemonUpload for DfdaemonUploadServerHandler {
         Span::current().record("remote_host_id", remote_host_id.as_str());
         Span::current().record("remote_peer_id", remote_peer_id.as_str());
 
-        // Clone the host state.
-        let host_info = self.host_info.clone();
+        // Get request interface and speed.
+        let mut request_interface = None;
+        let mut request_interface_speed = ByteSize::mb(10000).as_u64();
+        if let Some(request_ip) = request_ip {
+            // Get interface of this ip.
+            let interfaces = datalink::interfaces();
+            for net in interfaces.iter() {
+                if net.ips.iter().any(|ip| ip.contains(request_ip.ip())) {
+                    request_interface = Some(net.name.clone());
+                }
+            }
+
+            // Get speed of interface.
+            if let Some(interface) = request_interface.clone() {
+                let speed_path = format!("/sys/class/net/{}/speed", interface);
+                let content = fs::read_to_string(speed_path).unwrap_or("10000".to_string());
+                if let Ok(speed) = content.trim().parse::<u64>() {
+                    // Convert Mib/Sec to bit/Sec.
+                    debug!(
+                        "interface {} bandwidth is {}",
+                        &interface,
+                        ByteSize::mb(speed)
+                    );
+                    request_interface_speed = ByteSize::mb(speed).as_u64();
+                }
+            }
+        }
+        // Get sync interval.
+        let sync_interval = self.sync_interval;
 
         // Initialize stream channel.
-        let (out_stream_tx, out_stream_rx) = mpsc::channel(10 * 1024);
+        let (out_stream_tx, out_stream_rx) = mpsc::channel(1);
         tokio::spawn(
             async move {
+                // Start the host info update loop.
+                let mut networks = Networks::new_with_refreshed_list();
+                let mut last_refresh_time = SystemTime::now();
+                sleep(Duration::from_millis(100)).await;
+
                 info!("start send host info to host {}", host_id);
                 loop {
-                    // Get host info from local host info manager.
-                    let host = host_info.get_host_info(request_ip);
+                    let mut host = Host::default();
 
-                    if let Ok(host) = host {
-                        match out_stream_tx.send(Ok(host.clone())).await {
-                            Ok(_) => {
-                                debug!("sync host state to host {}", host_id.as_str());
+                    // Get network information by request ip
+                    let mut network = Network::default();
+
+                    // Refresh network information.
+                    networks.refresh();
+                    let new_time = SystemTime::now();
+                    let interval = new_time
+                        .duration_since(last_refresh_time)
+                        .unwrap()
+                        .as_millis() as u64;
+                    last_refresh_time = new_time;
+
+                    // Get interface available bandwidth.
+                    if let Some(request_interface) = request_interface.clone() {
+                        for (interface, data) in &networks {
+                            if *interface == request_interface {
+                                network.upload_rate =
+                                    request_interface_speed - data.transmitted() * 1000 / interval;
+                                debug!(
+                                    "refresh interface {} available bandwidth to {}",
+                                    interface,
+                                    ByteSize(network.upload_rate)
+                                );
                             }
-                            Err(err) => {
-                                info!("connection broken from host {}, err: {}", host_id, err);
-                                drop(out_stream_tx);
-                                break;
-                            }
+                        }
+                    }
+                    host.network = Some(network);
+
+                    match out_stream_tx.send(Ok(host.clone())).await {
+                        Ok(_) => {
+                            debug!("sync host state to host {}", host_id.as_str());
+                        }
+                        Err(err) => {
+                            info!("connection broken from host {}, err: {}", host_id, err);
+                            drop(out_stream_tx);
+                            break;
                         }
                     };
 
                     // Wait for the piece to be finished.
-                    tokio::time::sleep(host_info.get_interval()).await;
+                    tokio::time::sleep(sync_interval).await;
                 }
             }
             .in_current_span(),

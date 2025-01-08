@@ -24,5 +24,4 @@ pub mod proxy;
 pub mod resource;
 pub mod shutdown;
 pub mod stats;
-pub mod syncer;
 pub mod tracing;
