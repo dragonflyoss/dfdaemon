@@ -53,7 +53,6 @@ use sysinfo::Networks;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::sync::Barrier;
-use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
 use tonic::{
@@ -914,6 +913,7 @@ impl DfdaemonUpload for DfdaemonUploadServerHandler {
             for net in interfaces.iter() {
                 if net.ips.iter().any(|ip| ip.contains(request_ip.ip())) {
                     request_interface = Some(net.name.clone());
+                    break;
                 }
             }
 
@@ -938,9 +938,9 @@ impl DfdaemonUpload for DfdaemonUploadServerHandler {
         // Start the host info update loop.
         let mut networks = Networks::new_with_refreshed_list();
         let mut last_refresh_time = SystemTime::now();
-        sleep(FIRST_REFRESH_INTERVAL).await;
+        tokio::time::sleep(FIRST_REFRESH_INTERVAL).await;
 
-        info!("start send host info to host {}", host_id);
+        info!("start sending host info to host {}", remote_host_id);
         loop {
             let mut host = Host::default();
 
@@ -974,10 +974,13 @@ impl DfdaemonUpload for DfdaemonUploadServerHandler {
 
             match out_stream_tx.send(Ok(host.clone())).await {
                 Ok(_) => {
-                    debug!("sync host state to host {}", host_id.as_str());
+                    debug!("sync host info to remote host {}", remote_host_id.as_str());
                 }
                 Err(err) => {
-                    info!("connection broken from host {}, err: {}", host_id, err);
+                    info!(
+                        "connection broken from remote host {}, err: {}",
+                        remote_host_id, err
+                    );
                     drop(out_stream_tx);
                     break;
                 }
