@@ -873,11 +873,16 @@ impl DfdaemonUpload for DfdaemonUploadServerHandler {
         request: Request<SyncHostRequest>,
     ) -> Result<Response<Self::SyncHostStream>, Status> {
         /// DEFAULT_INTERFACE_SPEED is the default speed for interfaces.
-        const DEFAULT_INTERFACE_SPEED: ByteSize = ByteSize::mb(10000);
-        /// FIRST_REFRESH_INTERVAL is the interval between the first refresh of the network.
-        const FIRST_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
-        /// DEFAULT_REFRESH_INTERVAL is the default interval for refreshing the network.
-        const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+        const DEFAULT_INTERFACE_SPEED: ByteSize = ByteSize::mb(10000 / 8);
+        /// FIRST_HOST_INFO_REFRESH_INTERVAL is the interval for the first refresh of the host info
+        /// when start up.
+        const FIRST_HOST_INFO_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+        /// DEFAULT_HOST_INFO_REFRESH_INTERVAL is the default interval for refreshing the host info.
+        const DEFAULT_HOST_INFO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+        /// MILLISECONDS_PER_SECOND is the number of milliseconds contained per second.
+        const MILLISECONDS_PER_SECOND: u64 = 1_000;
+        /// BITS_PER_BYTE is the number of bits contained per byte.
+        const BITS_PER_BYTE: u64 = 8;
 
         // Get request ip.
         let request_ip = request.remote_addr();
@@ -904,11 +909,11 @@ impl DfdaemonUpload for DfdaemonUploadServerHandler {
         Span::current().record("remote_host_id", remote_host_id.as_str());
         Span::current().record("remote_peer_id", remote_peer_id.as_str());
 
-        // Get request interface and speed.
+        // Get the interface and the interface speed of this request ip.
         let mut request_interface = None;
         let mut request_interface_speed = DEFAULT_INTERFACE_SPEED.as_u64();
         if let Some(request_ip) = request_ip {
-            // Get interface of this ip.
+            // Get the interface of this request ip.
             let interfaces = datalink::interfaces();
             for net in interfaces.iter() {
                 if net.ips.iter().any(|ip| ip.contains(request_ip.ip())) {
@@ -917,78 +922,97 @@ impl DfdaemonUpload for DfdaemonUploadServerHandler {
                 }
             }
 
-            // Get speed of interface.
+            // Get speed of this interface.
             if let Some(interface) = request_interface.clone() {
                 let speed_path = format!("/sys/class/net/{}/speed", interface);
                 let content = fs::read_to_string(speed_path).unwrap_or_default();
                 if let Ok(speed) = content.trim().parse::<u64>() {
-                    // Convert Mib/Sec to bit/Sec.
-                    debug!(
-                        "interface {} bandwidth is {}",
+                    // Convert byte/Sec to bit/Sec.
+                    info!(
+                        "interface {} speed is {} for request ip {}",
                         &interface,
-                        ByteSize::mb(speed)
+                        ByteSize::mb(speed / BITS_PER_BYTE),
+                        request_ip,
                     );
-                    request_interface_speed = ByteSize::mb(speed).as_u64();
+                    request_interface_speed = ByteSize::mb(speed / BITS_PER_BYTE).as_u64();
                 }
             }
         }
 
         // Initialize stream channel.
         let (out_stream_tx, out_stream_rx) = mpsc::channel(1);
-        // Start the host info update loop.
-        let mut networks = Networks::new_with_refreshed_list();
-        let mut last_refresh_time = SystemTime::now();
-        tokio::time::sleep(FIRST_REFRESH_INTERVAL).await;
+        tokio::spawn(
+            async move {
+                info!("start sending host info to host {}", remote_host_id);
+                // Initialize sysinfo network.
+                let mut networks = Networks::new_with_refreshed_list();
+                let mut last_refresh_time = SystemTime::now();
+                // Sleep.
+                tokio::time::sleep(FIRST_HOST_INFO_REFRESH_INTERVAL).await;
 
-        info!("start sending host info to host {}", remote_host_id);
-        loop {
-            let mut host = Host::default();
+                // Start the host info update loop.
+                loop {
+                    let mut host = Host::default();
+                    let mut network = Network {
+                        upload_rate: request_interface_speed,
+                        ..Default::default()
+                    };
 
-            // Get network information by request ip
-            let mut network = Network::default();
+                    // Refresh network information.
+                    networks.refresh();
+                    let now_time = SystemTime::now();
+                    // Get interval between two refreshes.
+                    let interval = now_time
+                        .duration_since(last_refresh_time)
+                        .unwrap()
+                        .as_millis() as u64;
+                    // Reset last_refresh_time to now_time.
+                    last_refresh_time = now_time;
 
-            // Refresh network information.
-            networks.refresh();
-            let new_time = SystemTime::now();
-            let interval = new_time
-                .duration_since(last_refresh_time)
-                .unwrap()
-                .as_millis() as u64;
-            last_refresh_time = new_time;
-
-            // Get interface available bandwidth.
-            if let Some(request_interface) = request_interface.clone() {
-                for (interface, data) in &networks {
-                    if *interface == request_interface {
-                        network.upload_rate =
-                            (request_interface_speed - data.transmitted()) * 1000 / interval;
-                        debug!(
-                            "refresh interface {} available bandwidth to {}",
-                            interface,
-                            ByteSize(network.upload_rate)
-                        );
+                    // Get interface available bandwidth.
+                    if let Some(request_interface) = request_interface.clone() {
+                        for (interface, data) in &networks {
+                            if *interface == request_interface {
+                                if network.upload_rate
+                                    < data.transmitted() * MILLISECONDS_PER_SECOND / interval
+                                {
+                                    network.upload_rate = 0;
+                                } else {
+                                    network.upload_rate -=
+                                        data.transmitted() * MILLISECONDS_PER_SECOND / interval;
+                                }
+                                debug!(
+                                    "refresh interface {} available bandwidth to {}",
+                                    interface,
+                                    ByteSize(network.upload_rate)
+                                );
+                                break;
+                            }
+                        }
                     }
+                    host.network = Some(network);
+
+                    // Send host info.
+                    match out_stream_tx.send(Ok(host.clone())).await {
+                        Ok(_) => {
+                            debug!("sync host info to remote host {}", remote_host_id.as_str());
+                        }
+                        Err(err) => {
+                            info!(
+                                "connection broken from remote host {}, err: {}",
+                                remote_host_id, err
+                            );
+                            drop(out_stream_tx);
+                            break;
+                        }
+                    };
+
+                    // Sleep.
+                    tokio::time::sleep(DEFAULT_HOST_INFO_REFRESH_INTERVAL).await;
                 }
             }
-            host.network = Some(network);
-
-            match out_stream_tx.send(Ok(host.clone())).await {
-                Ok(_) => {
-                    debug!("sync host info to remote host {}", remote_host_id.as_str());
-                }
-                Err(err) => {
-                    info!(
-                        "connection broken from remote host {}, err: {}",
-                        remote_host_id, err
-                    );
-                    drop(out_stream_tx);
-                    break;
-                }
-            };
-
-            // Wait for the piece to be finished.
-            tokio::time::sleep(DEFAULT_REFRESH_INTERVAL).await;
-        }
+            .in_current_span(),
+        );
         Ok(Response::new(ReceiverStream::new(out_stream_rx)))
     }
 
