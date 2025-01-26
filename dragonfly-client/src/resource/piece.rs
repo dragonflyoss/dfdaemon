@@ -30,6 +30,7 @@ use dragonfly_client_util::id_generator::IDGenerator;
 use leaky_bucket::RateLimiter;
 use reqwest::header::{self, HeaderMap};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -333,7 +334,7 @@ impl Piece {
         length: u64,
         range: Option<Range>,
         disable_rate_limit: bool,
-    ) -> Result<impl AsyncRead> {
+    ) -> Result<Pin<Box<dyn AsyncRead + Send>>> {
         // Span record the piece_id.
         Span::current().record("piece_id", piece_id);
 
@@ -395,7 +396,7 @@ impl Piece {
         range: Option<Range>,
         disable_rate_limit: bool,
         is_prefetch: bool,
-    ) -> Result<impl AsyncRead> {
+    ) -> Result<Pin<Box<dyn AsyncRead + Send>>> {
         // Span record the piece_id.
         Span::current().record("piece_id", piece_id);
 
@@ -469,6 +470,7 @@ impl Piece {
         length: u64,
         parent: piece_collector::CollectedParent,
         is_prefetch: bool,
+        load_to_cache: bool,
     ) -> Result<metadata::Piece> {
         // Span record the piece_id.
         Span::current().record("piece_id", piece_id);
@@ -520,6 +522,14 @@ impl Piece {
                 };
             })?;
 
+        // Load piece content to cache from parent
+        if load_to_cache {
+            self.storage
+                .load_piece_to_cache(piece_id, &mut content.clone().as_slice(), length)
+                .await;
+            info!("load piece content to cache piece {}", piece_id);
+        }
+
         // Record the finish of downloading piece.
         match self
             .storage
@@ -566,6 +576,7 @@ impl Piece {
         length: u64,
         request_header: HeaderMap,
         is_prefetch: bool,
+        load_to_cache: bool,
         object_storage: Option<ObjectStorage>,
         hdfs: Option<Hdfs>,
     ) -> Result<metadata::Piece> {
@@ -680,16 +691,38 @@ impl Piece {
             start_time.elapsed(),
         );
 
+        let mut reader = response.reader;
+
+        if load_to_cache {
+            // Load piece content to cache from source.
+            self.storage
+                .load_piece_to_cache(piece_id, &mut reader, length)
+                .await;
+            info!("load piece content to cache: piece_id={}", piece_id);
+
+            let cache_reader = match self
+                .storage
+                .upload_piece_from_cache(piece_id, offset, length, None)
+                .await
+            {
+                Ok(reader) => reader,
+                Err(err) => {
+                    error!("download piece finished: {}", err);
+                    if let Some(err) = self.storage.download_piece_failed(piece_id).err() {
+                        error!("set piece metadata failed: {}", err)
+                    };
+
+                    return Err(err);
+                }
+            };
+
+            reader = Box::new(cache_reader);
+        }
+
         // Record the finish of downloading piece.
         match self
             .storage
-            .download_piece_from_source_finished(
-                piece_id,
-                task_id,
-                offset,
-                length,
-                &mut response.reader,
-            )
+            .download_piece_from_source_finished(piece_id, task_id, offset, length, &mut reader)
             .await
         {
             Ok(piece) => {

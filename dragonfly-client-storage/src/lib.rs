@@ -21,11 +21,14 @@ use dragonfly_client_util::digest::{Algorithm, Digest};
 use reqwest::header::HeaderMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncRead;
+use tracing::info;
 use tracing::{debug, error, instrument};
 
+pub mod cache;
 pub mod content;
 pub mod metadata;
 pub mod storage_engine;
@@ -43,6 +46,9 @@ pub struct Storage {
 
     /// content implements the content storage.
     content: content::Content,
+
+    /// cache implements the cache for preheat task.
+    cache: cache::Cache,
 }
 
 /// Storage implements the storage.
@@ -52,10 +58,13 @@ impl Storage {
     pub async fn new(config: Arc<Config>, dir: &Path, log_dir: PathBuf) -> Result<Self> {
         let metadata = metadata::Metadata::new(config.clone(), dir, &log_dir)?;
         let content = content::Content::new(config.clone(), dir).await?;
+        let cache = cache::Cache::new(config.clone())?;
+
         Ok(Storage {
             config,
             metadata,
             content,
+            cache,
         })
     }
 
@@ -395,7 +404,7 @@ impl Storage {
         piece_id: &str,
         task_id: &str,
         range: Option<Range>,
-    ) -> Result<impl AsyncRead> {
+    ) -> Result<Pin<Box<dyn AsyncRead + Send>>> {
         // Wait for the piece to be finished.
         self.wait_for_piece_finished(piece_id).await?;
 
@@ -405,6 +414,24 @@ impl Storage {
         // Get the piece metadata and return the content of the piece.
         match self.metadata.get_piece(piece_id) {
             Ok(Some(piece)) => {
+                // Try to upload piece content form cache.
+                if !self.cache.is_empty().await && self.cache.contains_piece(piece_id).await {
+                    match self
+                        .cache
+                        .read_piece(piece_id, piece.offset, piece.length, range)
+                        .await
+                    {
+                        Ok(cache_reader) => {
+                            // Finish uploading the task.
+                            info!("hit cache: {}", piece_id);
+                            self.metadata.upload_task_finished(task_id)?;
+                            return Ok(Box::pin(cache_reader));
+                        }
+                        Err(_err) => {}
+                    }
+                }
+
+                // Upload piece content from storage when cache entry is not hit or cache is empty.
                 match self
                     .content
                     .read_piece(task_id, piece.offset, piece.length, range)
@@ -413,7 +440,7 @@ impl Storage {
                     Ok(reader) => {
                         // Finish uploading the task.
                         self.metadata.upload_task_finished(task_id)?;
-                        Ok(reader)
+                        Ok(Box::pin(reader))
                     }
                     Err(err) => {
                         // Failed uploading the task.
@@ -479,6 +506,40 @@ impl Storage {
                 // Failed uploading the task.
                 self.metadata.upload_task_failed(task_id)?;
                 Err(err)
+            }
+        }
+    }
+
+    /// upload_piece_from_cache uploads the piece content by piece id from cache.
+    #[instrument(skip_all)]
+    pub async fn upload_piece_from_cache(
+        &self,
+        piece_id: &str,
+        offset: u64,
+        length: u64,
+        range: Option<Range>,
+    ) -> Result<impl AsyncRead> {
+        self.cache.read_piece(piece_id, offset, length, range).await
+    }
+
+    /// load_piece_to_cache loads the piece content with piece id to the cache.
+    #[instrument(skip_all)]
+    pub async fn load_piece_to_cache<R: AsyncRead + Unpin + ?Sized>(
+        &self,
+        piece_id: &str,
+        reader: &mut R,
+        length: u64,
+    ) {
+        // If the piece is already in the cache, return.
+        if self.cache.contains_piece(piece_id).await {
+            return;
+        }
+
+        // Load the piece content to the cache.
+        match self.cache.write_piece(piece_id, reader, length).await {
+            Ok(_) => {}
+            Err(err) => {
+                error!("load piece to cache failed: {}", err);
             }
         }
     }
