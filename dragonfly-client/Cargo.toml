@@ -90,6 +90,7 @@ futures-util = "0.3.31"
 termion = "4.0.3"
 tabled = "0.18.0"
 path-absolutize = "3.1.1"
+rand = "0.8.5"
 
 [dev-dependencies]
 tempfile.workspace = true

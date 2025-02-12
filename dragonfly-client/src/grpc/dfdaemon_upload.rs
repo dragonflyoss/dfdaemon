@@ -1631,6 +1631,17 @@ impl DfdaemonUploadClient {
         Ok(response.into_inner())
     }
 
+    /// sync_pieces provides the piece metadata for parent.
+    #[instrument(skip_all)]
+    pub async fn sync_host(
+        &self,
+        request: SyncHostRequest,
+    ) -> ClientResult<tonic::Response<tonic::codec::Streaming<Host>>> {
+        let request = Self::make_request(request);
+        let response = self.client.clone().sync_host(request).await?;
+        Ok(response)
+    }
+
     /// make_request creates a new request with timeout.
     #[instrument(skip_all)]
     fn make_request<T>(request: T) -> tonic::Request<T> {
